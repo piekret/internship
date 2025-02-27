@@ -5,3 +5,4 @@ datetime
 passlib
 fastapi
 jwt
+smtplib
