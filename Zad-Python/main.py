@@ -150,7 +150,7 @@ def db():
 def get_user_by_username(db: Session, username: str):
     return db.query(User).filter(User.username == username).first()
 
-async def get_curr_user(token: str = Depends(oauth2_scheme), db: Session = Depends(db())):
+async def get_curr_user(token: str = Depends(oauth2_scheme), db: Session = Depends(db)):
     credentials_exception = HTTPException(status_code=400, detail="Provided data is wrong")
 
     try:
@@ -193,7 +193,7 @@ def send_email(receiver: str, msg: str):
 app = FastAPI()
 
 @app.post("/register", response_model=ReturnUser)
-async def register(user: CreateUser, db: Session = Depends(db())):
+async def register(user: CreateUser, db: Session = Depends(db)):
     if get_user_by_username(db, user.username):
         raise HTTPException(status_code=400, detail="This user already exists")
     
@@ -205,7 +205,7 @@ async def register(user: CreateUser, db: Session = Depends(db())):
 
 
 @app.post("/login", response_model=Token)
-async def login(data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(db())):
+async def login(data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(db)):
     user = get_user_by_username(db, data.username)
     if not user or not verify(data.password, user.password):
         raise HTTPException(status_code=401, detail="Login failed")
@@ -216,11 +216,11 @@ async def login(data: OAuth2PasswordRequestForm = Depends(), db: Session = Depen
 
 # Get
 @app.get("/resources", response_model=list[ReturnResource])
-async def get_resources(limit: int = 10, db: Session = Depends(db()), cuser: User = Depends(get_curr_user)): # argument user upewnia się, że użytkownik jest zalogowany
+async def get_resources(limit: int = 10, db: Session = Depends(db), cuser: User = Depends(get_curr_user)): # argument user upewnia się, że użytkownik jest zalogowany
     return db.query(Resource).limit(limit).all()
 
 @app.get("/resources/{id}", response_model=ReturnResource)
-async def get_resource(id: int, db: Session = Depends(db()), user: User = Depends(get_curr_user)):
+async def get_resource(id: int, db: Session = Depends(db), user: User = Depends(get_curr_user)):
     resource = db.query(Resource).filter(Resource.id == id).first()
     if not resource:
         raise HTTPException(status_code=404, detail="Resource not found")
@@ -228,11 +228,11 @@ async def get_resource(id: int, db: Session = Depends(db()), user: User = Depend
     return resource
 
 @app.get("/reservations", response_model=list[ReturnReservation])
-async def get_reservations(limit: int = 10, db: Session = Depends(db()), user: User = Depends(get_curr_user)):
+async def get_reservations(limit: int = 10, db: Session = Depends(db), user: User = Depends(get_curr_user)):
     return db.query(Reservation).limit(limit).all()
 
 @app.get("/reservations/{id}", response_model=ReturnReservation)
-async def get_reservation(id: int, db: Session = Depends(db()), user: User = Depends(get_curr_user)):
+async def get_reservation(id: int, db: Session = Depends(db), user: User = Depends(get_curr_user)):
     reservation = db.query(Resource).filter(Resource.id == id).first()
     if not reservation:
         raise HTTPException(status_code=404, detail="Resource not found")
@@ -242,7 +242,7 @@ async def get_reservation(id: int, db: Session = Depends(db()), user: User = Dep
 
 # Post
 @app.post("/resources", response_model=ReturnResource)
-async def create_resource(resource: CreateResource, db: Session = Depends(db()), user: User = Depends(get_curr_user)):
+async def create_resource(resource: CreateResource, db: Session = Depends(db), user: User = Depends(get_curr_user)):
     if not user.admin:
         raise HTTPException(status_code=403, detail="No permissions")
     new_resource = Resource(**resource.model_dump())
@@ -253,7 +253,7 @@ async def create_resource(resource: CreateResource, db: Session = Depends(db()),
     return new_resource
 
 @app.post("/reservations", response_model=ReturnReservation)
-async def create_reservation(reservation: CreateReservation, bg: BackgroundTasks, db: Session = Depends(db()), user: User = Depends(get_curr_user)):
+async def create_reservation(reservation: CreateReservation, bg: BackgroundTasks, db: Session = Depends(db), user: User = Depends(get_curr_user)):
     duration = (reservation.end_date - reservation.start_date).total_seconds() / 60
     resource = db.query(Resource).filter(Resource.id == reservation.resource_id).first()
 
@@ -283,3 +283,73 @@ async def create_reservation(reservation: CreateReservation, bg: BackgroundTasks
 
     return new_reservation
 
+
+# Put
+@app.put("/resources/{id}", response_model=ReturnResource)
+async def update_resource(id: int, data: CreateResource, db: Session = Depends(db), user: User = Depends(get_curr_user)):
+    if not user.admin:
+        raise HTTPException(status_code=403, detail="No permission")
+    
+    resource = db.query(Resource).filter(Resource.id == id).first()
+    if not resource:
+        raise HTTPException(status_code=404, detail="Resource not found")
+    
+    for key, value in data.__dict__.items():
+        setattr(resource, key, value)
+    db.commit()
+    db.refresh(resource)
+
+    return resource
+    
+@app.put("/reservations/{id}", response_model=ReturnReservation)
+async def update_reservation(id: int, data: CreateReservation, db: Session = Depends(db), user: User = Depends(get_curr_user)):
+    reservation = db.query(Reservation).filter(Reservation.id == id).first()
+    duration = (reservation.end_date - reservation.start_date).total_seconds() / 60
+    resource = db.query(Resource).filter(Resource.id == data.resource_id).first()
+    
+    if not reservation:
+        raise HTTPException(status_code=404, detail="Reservation not found")
+    if not user.admin and reservation.user_id != user.id:
+        raise HTTPException(status_code=403, detail="No permissions")
+    if conflit(db, data.resource_id, data.start_date, data.end_date, reservation_id=id):
+        raise HTTPException(status_code=400, detail="Reservation exists at the given datetime")
+    if duration < resource.min_duration or duration > resource.max_duration:
+        raise HTTPException(status_code=400, detail="Duration greater or lesser than the set limits")
+    
+    reservation.resource_id = data.resource_id
+    reservation.start_date = data.start_date
+    reservation.end_date = data.end_date
+    db.commit()
+    db.refresh(reservation)
+
+    return reservation
+
+
+# Delete
+@app.delete("/resources/{id}")
+async def delete_resource(id: int, db: Session = Depends(db), user: User = Depends(get_curr_user)):
+    if not user.admin():
+        raise HTTPException(status_code=403, detail="No permission")
+    
+    resource = db.query(Resource).filter(Resource.id == id).first()
+    if not resource:
+        raise HTTPException(status_code=404, detail="Resource not found")
+    
+    db.delete(resource)
+    db.commit()
+
+    return {"message": "Deletion successful"}
+
+@app.delete("/reservations/{id}")
+async def delete_reservation(id: int, db: Session = Depends(db), user: User = Depends(get_curr_user)):
+    reservation = db.query(Reservation).filter(Reservation.id == id).first()
+
+    if not reservation:
+        raise HTTPException(status_code=404, detail="Reservation not found")
+    if not user.admin != "admin" and reservation.user_id != user.id:
+        raise HTTPException(status_code=403, detail="Brak uprawnień")
+    
+    db.delete(reservation)
+    db.commit()
+
+    return {"message": "Deletion successful"}
