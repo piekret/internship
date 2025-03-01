@@ -1,4 +1,4 @@
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, ForeignKey
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, ForeignKey, func
 from sqlalchemy.orm import sessionmaker, relationship, Session, declarative_base
 from pydantic import BaseModel
 from typing import Literal
@@ -7,8 +7,10 @@ from passlib.context import CryptContext
 from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 import jwt
-from jwt.exceptions import JWTException
 import smtplib
+import uvicorn
+import csv
+import json
 
 # JWT
 SECRET_KEY = "acbdsigmasigmaboy"
@@ -34,17 +36,18 @@ class Resource(Base):
     availability = Column(String)
     min_duration = Column(Integer, default=30)
     max_duration = Column(Integer, default=480)
-    reservations = relationship("Reservation", back_populates="resource")
+    reservations = relationship("Reservation", back_populates="resources")
 
 
 
 class User(Base):
+    __tablename__ = "users"
     id = Column(Integer, primary_key=True, index=True)
     username = Column(String, unique=True, index=True)
     password = Column(String)
     email = Column(String)
     admin = Column(Integer, default=0)
-    reservations = relationship("Reservation", back_populates="user")
+    reservations = relationship("Reservation", back_populates="users")
 
 
 class Reservation(Base):
@@ -64,7 +67,7 @@ Base.metadata.create_all(bind=engine)
 # Schematy do walidacji
 class CreateResource(BaseModel):
     name: str
-    resource_type: str
+    type: str
     location: str
     availability: str
     min_duration: int | None = 30    # jeśli nie zostanie podane, default to 30
@@ -73,13 +76,14 @@ class CreateResource(BaseModel):
 class ReturnResource(BaseModel):
     id: int
     name: str
-    resource_type: str
+    type: str
     location: str
     availability: str
     min_duration: int
     max_duration: int
-    class Config:
-        orm_mode = True     # pozwala modelowi bezpośrednie pracowanie z obiektami ORM
+    model_config = {
+        "from_attributes": True
+    }
 
 
 class CreateUser(BaseModel):
@@ -93,8 +97,9 @@ class ReturnUser(BaseModel):
     username: str
     email: str
     admin: int
-    class Config:
-        orm_mode = True
+    model_config = {
+        "from_attributes": True
+    }
 
 class CreateReservation(BaseModel):
     resource_id: int
@@ -107,8 +112,9 @@ class ReturnReservation(BaseModel):
     resource_id: int
     start_date: datetime
     end_date: datetime
-    class Config:
-        orm_mode = True
+    model_config = {
+        "from_attributes": True
+    }
 
 class Token(BaseModel):
     token: str
@@ -120,7 +126,7 @@ class TokenData(BaseModel):
 
 # Zabezpieczenia
 context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/login")
 
 def verify(password, hash):
     return context.verify(password, hash)
@@ -133,7 +139,7 @@ def create_access_token(data: dict, expires_delta: timedelta | None = None):
     if expires_delta:
         expire = datetime.now(timezone.utc) + expires_delta
     else:
-        expire = datetime.now(timezone.utc) + timedelta(minutes=15)
+        expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     to_encode.update({"exp": expire})
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
@@ -151,7 +157,7 @@ def get_user_by_username(db: Session, username: str):
     return db.query(User).filter(User.username == username).first()
 
 async def get_curr_user(token: str = Depends(oauth2_scheme), db: Session = Depends(db)):
-    credentials_exception = HTTPException(status_code=400, detail="Provided data is wrong")
+    credentials_exception = HTTPException(status_code=401, detail="Provided data is wrong", headers={"WWW-Authenticate": "Bearer"})
 
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms = [ALGORITHM])
@@ -159,7 +165,7 @@ async def get_curr_user(token: str = Depends(oauth2_scheme), db: Session = Depen
         if not username:
             raise credentials_exception
         data = TokenData(username=username)
-    except JWTException:
+    except Exception:
         raise credentials_exception
     
     user = get_user_by_username(db, username=data.username)
@@ -210,8 +216,9 @@ async def login(data: OAuth2PasswordRequestForm = Depends(), db: Session = Depen
     if not user or not verify(data.password, user.password):
         raise HTTPException(status_code=401, detail="Login failed")
     
-    access_token = create_access_token(data={"sub": user.username})
-    return {"access_token": access_token, "token_type": "bearer"}
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(data={"sub": user.username}, expires_delta=access_token_expires)
+    return {"token": access_token, "type": "bearer"}
 
 
 # Get
@@ -229,11 +236,17 @@ async def get_resource(id: int, db: Session = Depends(db), user: User = Depends(
 
 @app.get("/reservations", response_model=list[ReturnReservation])
 async def get_reservations(limit: int = 10, db: Session = Depends(db), user: User = Depends(get_curr_user)):
-    return db.query(Reservation).limit(limit).all()
+    reservations = db.query(Reservation).limit(limit).all()
+    valid_reservations = []
+    for r in reservations:
+        if not r.resource_id:
+            continue
+        valid_reservations.append(r)
+    return valid_reservations
 
 @app.get("/reservations/{id}", response_model=ReturnReservation)
 async def get_reservation(id: int, db: Session = Depends(db), user: User = Depends(get_curr_user)):
-    reservation = db.query(Resource).filter(Resource.id == id).first()
+    reservation = db.query(Reservation).filter(Reservation.id == id).first()
     if not reservation:
         raise HTTPException(status_code=404, detail="Resource not found")
 
@@ -269,15 +282,15 @@ async def create_reservation(reservation: CreateReservation, bg: BackgroundTasks
     new_reservation = Reservation(
         user_id=user.id,
         resource_id=reservation.resource_id,
-        start_datetime=reservation.start_date,
-        end_datetime=reservation.end_date
+        start_date=reservation.start_date,
+        end_date=reservation.end_date
     )
 
     db.add(new_reservation)
     db.commit()
     db.refresh(new_reservation)
 
-    notify_time = new_reservation.start_date - timedelta(hours=1)
+    notify_time = new_reservation.start_date.replace(tzinfo=timezone.utc) - timedelta(hours=1)
     if notify_time < datetime.now(timezone.utc):
         bg.add_task(send_email, user.email, f"Resource reservation reminder {resource.name} at {new_reservation.start_date}")
 
@@ -328,7 +341,7 @@ async def update_reservation(id: int, data: CreateReservation, db: Session = Dep
 # Delete
 @app.delete("/resources/{id}")
 async def delete_resource(id: int, db: Session = Depends(db), user: User = Depends(get_curr_user)):
-    if not user.admin():
+    if not user.admin:
         raise HTTPException(status_code=403, detail="No permission")
     
     resource = db.query(Resource).filter(Resource.id == id).first()
@@ -347,9 +360,72 @@ async def delete_reservation(id: int, db: Session = Depends(db), user: User = De
     if not reservation:
         raise HTTPException(status_code=404, detail="Reservation not found")
     if not user.admin != "admin" and reservation.user_id != user.id:
-        raise HTTPException(status_code=403, detail="Brak uprawnień")
+        raise HTTPException(status_code=403, detail="No permission")
     
     db.delete(reservation)
     db.commit()
 
     return {"message": "Deletion successful"}
+
+
+# Statystyki i eksport
+@app.get("/statistics")
+async def statistics(db: Session = Depends(db), user: User = Depends(get_curr_user)):
+    if not user.admin:
+        raise HTTPException(status_code=403, detail="No permission")
+
+    now = datetime.now(timezone.utc)
+    daily_reserv = db.query(Reservation).filter(Reservation.start_date >= now - timedelta(days=1)).count()
+    weekly_reserv = db.query(Reservation).filter(Reservation.start_date >= now - timedelta(weeks=1)).count()
+    monthly_reserv = db.query(Reservation).filter(Reservation.start_date >= now - timedelta(days=30)).count()
+
+    common_resources = db.query(Resource.name, func.count(Reservation.id).label("id_count"))\
+        .join(Reservation)\
+        .group_by(Resource.id)\
+        .order_by(func.count(Reservation.id).desc())\
+        .limit(5).all()
+
+    reservations = db.query(Reservation).all()
+    total_duration = sum([(r.end_date - r.start_date).total_seconds() for r in reservations])
+    avg_duration = (total_duration / len(reservations)) / 60 if reservations else 0
+
+    return {
+        "daily_reservations": daily_reserv,
+        "weekly_reservations": weekly_reserv,
+        "monthly_reservations": monthly_reserv,
+        "most_common_resources": [{"name": r[0], "count": r[1]} for r in common_resources],
+        "average_reservation_time": avg_duration
+    }
+
+@app.get("/export")
+async def export(format: Literal["json", "csv"] = "json", db: Session = Depends(db), user: User = Depends(get_curr_user)):
+    if not user.admin:
+        raise HTTPException(status_code=403, detail="No permission")
+    
+    resources = [ReturnResource.model_validate(r).model_dump(mode="json") for r in db.query(Resource).all()]
+    reservations = [ReturnReservation.model_validate(r).model_dump(mode="json") for r in db.query(Reservation).all()]
+
+    data = {
+        "resources": resources,
+        "reservations": reservations
+    }
+
+    if format == "csv":
+        with open("data.csv", "w", newline="") as file:
+            w = csv.writer(file, delimiter=",")
+            for r in data["resources"]:
+                w.writerow(r.values())
+            
+            for r in data["reservations"]:
+                w.writerow(r.values())
+
+        return {"message": "Data exported successfully"}
+    else:
+        with open("data.json", "w", newline="") as file:
+            json_object = json.dump(data, file, ensure_ascii=False, indent=4)
+        
+        return {"message": "Data exported successfully"}
+
+
+if __name__ == "__main__":
+    uvicorn.run("main:app", host="127.0.0.1", port=2008, reload=True)

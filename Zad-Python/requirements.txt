@@ -2,7 +2,12 @@ sqlalchemy
 pydantic
 typing
 datetime
-passlib
+passlib==1.7.4
 fastapi
-jwt
+PyJWT
 smtplib
+uvicorn
+csv
+json
+python-multipart
+bcrypt==3.2.2
